@@ -2,10 +2,12 @@ import asyncio
 import os
 import random
 import re
+import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
+from pymysql.err import IntegrityError as MySQLIntegrityError
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -21,6 +23,13 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 from dotenv import load_dotenv
+from db_backend import (
+    close_db_backend,
+    db_session,
+    init_db_backend,
+    is_mysql,
+    row_to_dict,
+)
 from admin_handlers import register_admin_handlers
 from activities_handlers import register_activities_handlers
 from questions_handlers import register_questions_handlers
@@ -50,10 +59,150 @@ ACTIVITY_QUIZ_REWARD = "Квиз о банке"
 ACTIVITY_ADMIN_LECTURE_FALLBACK = "Лекция (админ)"
 ACTIVITY_ADMIN_MANUAL = "Ручное начисление (админ)"
 
+
+def _transactions_type_column() -> str:
+    """В MySQL `type` — зарезервированное слово, нужны обратные кавычки."""
+    return "`type`" if is_mysql() else "type"
+
+
+def _activities_seed_rows() -> list[tuple[str, int, int, int]]:
+    return [
+        (ACTIVITY_WELCOME, 100, 1, 0),
+        ("HR-свидание (общение с рекрутерами)", 100, 1, 0),
+        ("ИТ-Дженга", 200, 1, 0),
+        ("ИТ-МЕМО", 200, 1, 0),
+        ("Скрипт-мастер", 200, 1, 0),
+        ("Объяснительная", 200, 1, 0),
+        ("Финансовые активы", 200, 1, 0),
+        ("Финансы судьбы", 200, 1, 0),
+        ("Подписка на Telegram‑канал", 100, 1, 0),
+        ("Подписка на VK‑сообщество", 100, 1, 0),
+        (ACTIVITY_QUIZ_REWARD, 10, 20, 0),
+        ("Лекция 1", 400, 1, 1),
+        ("Лекция 2", 400, 1, 1),
+        ("Лекция 3", 400, 1, 1),
+        (ACTIVITY_ADMIN_LECTURE_FALLBACK, 400, 4, 0),
+        (ACTIVITY_ADMIN_MANUAL, 0, 999999, 0),
+    ]
+
+
+async def _mysql_init_schema_and_seed(db: Any) -> None:
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            telegram_id BIGINT NOT NULL,
+            username VARCHAR(255) NULL,
+            name VARCHAR(255) NOT NULL,
+            badge_id VARCHAR(255) NOT NULL,
+            wallet_id VARCHAR(255) NOT NULL,
+            balance INT NOT NULL DEFAULT 0,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_users_telegram (telegram_id),
+            UNIQUE KEY uq_users_badge (badge_id),
+            UNIQUE KEY uq_users_wallet (wallet_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activities (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            title VARCHAR(512) NOT NULL,
+            points INT NOT NULL,
+            is_active TINYINT NOT NULL DEFAULT 1,
+            limit_per_user INT NOT NULL DEFAULT 1,
+            is_lecture TINYINT NOT NULL DEFAULT 0,
+            UNIQUE KEY uq_activities_title (title)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    cur = await db.execute(
+        """
+        SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'activities'
+          AND COLUMN_NAME = 'is_lecture'
+        """
+    )
+    row = await cur.fetchone()
+    if row is not None and int(row_to_dict(row).get("c") or 0) == 0:
+        await db.execute(
+            "ALTER TABLE activities ADD COLUMN is_lecture TINYINT NOT NULL DEFAULT 0"
+        )
+
+    tc = _transactions_type_column()
+    await db.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            user_id INT UNSIGNED NOT NULL,
+            activity_id INT UNSIGNED NOT NULL,
+            points INT NOT NULL,
+            {tc} VARCHAR(32) NOT NULL,
+            created_by_admin_tg_id BIGINT NULL,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_transactions_user FOREIGN KEY (user_id) REFERENCES users (id),
+            CONSTRAINT fk_transactions_activity FOREIGN KEY (activity_id) REFERENCES activities (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS karma_debits (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            user_id INT UNSIGNED NOT NULL,
+            points INT NOT NULL,
+            created_by_admin_tg_id BIGINT NOT NULL,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_karma_user FOREIGN KEY (user_id) REFERENCES users (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS open_mic_questions (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            user_id INT UNSIGNED NOT NULL,
+            text TEXT NOT NULL,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_open_mic_user FOREIGN KEY (user_id) REFERENCES users (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+
+    activities = _activities_seed_rows()
+    for title, points, limit_per_user, is_lecture in activities:
+        await db.execute(
+            """
+            INSERT INTO activities (title, points, is_active, limit_per_user, is_lecture)
+            VALUES (?, ?, 1, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                points = VALUES(points),
+                is_active = 1,
+                limit_per_user = VALUES(limit_per_user),
+                is_lecture = VALUES(is_lecture)
+            """,
+            (title, points, limit_per_user, is_lecture),
+        )
+
+    active_titles = [t for (t, _p, _l, _il) in activities]
+    placeholders = ",".join(["?"] * len(active_titles))
+    await db.execute(
+        f"""
+        UPDATE activities
+        SET is_active = 0
+        WHERE title NOT IN ({placeholders})
+        """,
+        active_titles,
+    )
+    await db.commit()
+
+
 if not BOT_TOKEN:
     raise RuntimeError(
         "Не задан BOT_TOKEN. Локально — в tg_coin_bot/.env; на Railway — "
-        "Variables → добавь BOT_TOKEN (и при необходимости ADMIN_IDS, DB_PATH)."
+        "Variables → BOT_TOKEN, подключи MySQL и задай MYSQL_URL (или DATABASE_URL "
+        "вида mysql://...); без них бот использует локальный SQLite (DB_PATH)."
     )
 
 
@@ -110,7 +259,7 @@ def career_demo_text(name: str) -> str:
     )
 
 
-async def _migrate_transactions_drop_activity_unique(db: aiosqlite.Connection) -> None:
+async def _migrate_transactions_drop_activity_unique(db: Any) -> None:
     """Снимаем UNIQUE(user_id, activity_id, type), чтобы limit_per_user > 1 работал через счётчик."""
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transactions'"
@@ -155,7 +304,13 @@ async def _migrate_transactions_drop_activity_unique(db: aiosqlite.Connection) -
 
 
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    await init_db_backend(DB_PATH)
+    if is_mysql():
+        async with db_session() as db:
+            await _mysql_init_schema_and_seed(db)
+        return
+
+    async with db_session() as db:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -183,10 +338,9 @@ async def init_db() -> None:
             """
         )
 
-        # Мягкая миграция: добавляем новый столбец is_lecture, если его ещё нет.
         cols_cursor = await db.execute("PRAGMA table_info(activities)")
         cols = await cols_cursor.fetchall()
-        col_names = {row[1] for row in cols}  # row[1] = name
+        col_names = {row[1] for row in cols}
         if "is_lecture" not in col_names:
             await db.execute(
                 "ALTER TABLE activities ADD COLUMN is_lecture INTEGER NOT NULL DEFAULT 0"
@@ -236,28 +390,7 @@ async def init_db() -> None:
             """
         )
 
-        # Актуальный список активностей/баллов.
-        # Важно: используем UPSERT, чтобы обновлять уже существующие записи в БД.
-        activities: list[tuple[str, int, int, int]] = [
-            (ACTIVITY_WELCOME, 100, 1, 0),
-            ("HR-свидание (общение с рекрутерами)", 100, 1, 0),
-            ("ИТ-Дженга", 200, 1, 0),
-            ("ИТ-МЕМО", 200, 1, 0),
-            ("Скрипт-мастер", 200, 1, 0),
-            ("Объяснительная", 200, 1, 0),
-            ("Финансовые активы", 200, 1, 0),
-            ("Финансы судьбы", 200, 1, 0),
-            ("Подписка на Telegram‑канал", 100, 1, 0),
-            ("Подписка на VK‑сообщество", 100, 1, 0),
-            # Квиз: до 20 правильных ответов по 10 кармы (макс 200).
-            (ACTIVITY_QUIZ_REWARD, 10, 20, 0),
-            ("Лекция 1", 400, 1, 1),
-            ("Лекция 2", 400, 1, 1),
-            ("Лекция 3", 400, 1, 1),
-            (ACTIVITY_ADMIN_LECTURE_FALLBACK, 400, 4, 0),
-            (ACTIVITY_ADMIN_MANUAL, 0, 999999, 0),
-        ]
-
+        activities = _activities_seed_rows()
         for title, points, limit_per_user, is_lecture in activities:
             await db.execute(
                 """
@@ -272,7 +405,6 @@ async def init_db() -> None:
                 (title, points, limit_per_user, is_lecture),
             )
 
-        # Деактивируем активности, которых больше нет в списке.
         active_titles = [t for (t, _p, _l, _is_lecture) in activities]
         placeholders = ",".join(["?"] * len(active_titles))
         await db.execute(
@@ -288,7 +420,7 @@ async def init_db() -> None:
 
 
 async def get_open_mic_questions_count_for_user(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_session() as db:
         cursor = await db.execute(
             "SELECT COUNT(*) AS count FROM open_mic_questions WHERE user_id = ?",
             (user_id,),
@@ -296,11 +428,11 @@ async def get_open_mic_questions_count_for_user(user_id: int) -> int:
         row = await cursor.fetchone()
         if row is None:
             return 0
-        return int(row[0])
+        return int(row_to_dict(row)["count"])
 
 
 async def create_open_mic_question(user_id: int, text: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_session() as db:
         await db.execute(
             "INSERT INTO open_mic_questions (user_id, text) VALUES (?, ?)",
             (user_id, text),
@@ -309,25 +441,23 @@ async def create_open_mic_question(user_id: int, text: str) -> None:
 
 
 async def get_user_by_telegram_id(telegram_id: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with db_session() as db:
         cursor = await db.execute(
             "SELECT * FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return row_to_dict(row) if row else None
 
 
 async def get_user_by_badge_id(badge_id: str) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with db_session() as db:
         cursor = await db.execute(
             "SELECT * FROM users WHERE badge_id = ?",
             (badge_id,),
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return row_to_dict(row) if row else None
 
 
 async def create_user(
@@ -336,17 +466,23 @@ async def create_user(
     name: str,
     badge_id: str,
 ) -> dict:
-    wallet_id = str(random.randint(1000000, 9999999))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO users (telegram_id, username, name, badge_id, wallet_id, balance)
-            VALUES (?, ?, ?, ?, ?, 0)
-            """,
-            (telegram_id, username, name, badge_id, wallet_id),
-        )
-        await db.commit()
+    for _ in range(24):
+        wallet_id = str(random.randint(1000000, 9999999))
+        try:
+            async with db_session() as db:
+                await db.execute(
+                    """
+                    INSERT INTO users (telegram_id, username, name, badge_id, wallet_id, balance)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                    """,
+                    (telegram_id, username, name, badge_id, wallet_id),
+                )
+                await db.commit()
+            break
+        except (sqlite3.IntegrityError, MySQLIntegrityError):
+            continue
+    else:
+        raise RuntimeError("Не удалось создать пользователя: не удалось выбрать уникальный wallet_id.")
 
     user = await get_user_by_telegram_id(telegram_id)
     if user is None:
@@ -356,8 +492,7 @@ async def create_user(
 
 async def get_activities_for_admin_accrual() -> list[dict]:
     """Активности для кнопок начисления в админке: без регистрации, квиза и лекций."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with db_session() as db:
         cursor = await db.execute(
             """
             SELECT * FROM activities
@@ -369,18 +504,17 @@ async def get_activities_for_admin_accrual() -> list[dict]:
             (ACTIVITY_WELCOME, ACTIVITY_QUIZ_REWARD),
         )
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        return [row_to_dict(row) for row in rows]
 
 
 async def get_activity_by_id(activity_id: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with db_session() as db:
         cursor = await db.execute(
             "SELECT * FROM activities WHERE id = ?",
             (activity_id,),
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return row_to_dict(row) if row else None
 
 
 async def grant_activity_once(
@@ -389,9 +523,8 @@ async def grant_activity_once(
     admin_tg_id: Optional[int],
 ) -> tuple[bool, str, Optional[dict]]:
     """Начисление по названию активности; число записей ограничено limit_per_user в БД."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
+    tc = _transactions_type_column()
+    async with db_session() as db:
         user_cursor = await db.execute(
             "SELECT * FROM users WHERE id = ?",
             (user_id,),
@@ -408,17 +541,17 @@ async def grant_activity_once(
         if not activity_row:
             return False, "Активность не найдена.", None
 
-        user = dict(user_row)
-        activity = dict(activity_row)
+        user = row_to_dict(user_row)
+        activity = row_to_dict(activity_row)
         activity_id = activity["id"]
 
         duplicate_cursor = await db.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM transactions
             WHERE user_id = ?
               AND activity_id = ?
-              AND type = 'accrual'
+              AND {tc} = 'accrual'
             """,
             (user_id, activity_id),
         )
@@ -426,8 +559,8 @@ async def grant_activity_once(
         if duplicate_row is None:
             return False, "Не удалось проверить дубликаты начисления.", None
 
-        cnt = duplicate_row["count"]
-        lim = activity["limit_per_user"]
+        cnt = int(row_to_dict(duplicate_row)["count"])
+        lim = int(activity["limit_per_user"])
         if cnt >= lim:
             return (
                 False,
@@ -436,12 +569,12 @@ async def grant_activity_once(
             )
 
         await db.execute(
-            """
+            f"""
             INSERT INTO transactions (
                 user_id,
                 activity_id,
                 points,
-                type,
+                {tc},
                 created_by_admin_tg_id
             )
             VALUES (?, ?, ?, 'accrual', ?)
@@ -469,7 +602,7 @@ async def grant_activity_once(
             return False, "Участник не найден после начисления.", None
 
         result = {
-            "user": dict(updated_user_row),
+            "user": row_to_dict(updated_user_row),
             "activity": activity,
             "points": activity["points"],
         }
@@ -481,9 +614,8 @@ async def add_points(
     activity_id: int,
     admin_tg_id: int,
 ) -> tuple[bool, str, Optional[dict]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
+    tc = _transactions_type_column()
+    async with db_session() as db:
         user_cursor = await db.execute(
             "SELECT * FROM users WHERE id = ?",
             (user_id,),
@@ -502,8 +634,8 @@ async def add_points(
         if not activity_row:
             return False, "Активность не найдена или неактивна.", None
 
-        user = dict(user_row)
-        activity = dict(activity_row)
+        user = row_to_dict(user_row)
+        activity = row_to_dict(activity_row)
 
         if int(activity.get("is_lecture") or 0):
             return (
@@ -520,12 +652,12 @@ async def add_points(
             )
 
         duplicate_cursor = await db.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM transactions
             WHERE user_id = ?
               AND activity_id = ?
-              AND type = 'accrual'
+              AND {tc} = 'accrual'
             """,
             (user_id, activity_id),
         )
@@ -533,8 +665,8 @@ async def add_points(
         if duplicate_row is None:
             return False, "Не удалось проверить дубликаты начисления.", None
 
-        cnt = duplicate_row["count"]
-        lim = activity["limit_per_user"]
+        cnt = int(row_to_dict(duplicate_row)["count"])
+        lim = int(activity["limit_per_user"])
         if cnt >= lim:
             return (
                 False,
@@ -544,12 +676,12 @@ async def add_points(
             )
 
         await db.execute(
-            """
+            f"""
             INSERT INTO transactions (
                 user_id,
                 activity_id,
                 points,
-                type,
+                {tc},
                 created_by_admin_tg_id
             )
             VALUES (?, ?, ?, 'accrual', ?)
@@ -577,7 +709,7 @@ async def add_points(
             return False, "Участник не найден после начисления.", None
 
         result = {
-            "user": dict(updated_user_row),
+            "user": row_to_dict(updated_user_row),
             "activity": activity,
             "points": activity["points"],
         }
@@ -593,9 +725,8 @@ async def manual_add_points(
     if points <= 0:
         return False, "Укажи целое число баллов больше нуля.", None
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
+    tc = _transactions_type_column()
+    async with db_session() as db:
         user_cursor = await db.execute(
             "SELECT * FROM users WHERE id = ?",
             (user_id,),
@@ -612,15 +743,15 @@ async def manual_add_points(
         if not activity_row:
             return False, "Активность для ручного начисления не найдена.", None
 
-        activity = dict(activity_row)
+        activity = row_to_dict(activity_row)
 
         await db.execute(
-            """
+            f"""
             INSERT INTO transactions (
                 user_id,
                 activity_id,
                 points,
-                type,
+                {tc},
                 created_by_admin_tg_id
             )
             VALUES (?, ?, ?, 'accrual', ?)
@@ -648,7 +779,11 @@ async def manual_add_points(
         return (
             True,
             "Карма начислена.",
-            {"user": dict(updated_user_row), "points": points, "activity": activity},
+            {
+                "user": row_to_dict(updated_user_row),
+                "points": points,
+                "activity": activity,
+            },
         )
 
 
@@ -660,8 +795,7 @@ async def deduct_karma(
     if points <= 0:
         return False, "Укажи целое число баллов больше нуля.", None
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with db_session() as db:
         user_cursor = await db.execute(
             "SELECT * FROM users WHERE id = ?",
             (user_id,),
@@ -670,8 +804,8 @@ async def deduct_karma(
         if not user_row:
             return False, "Участник не найден.", None
 
-        user = dict(user_row)
-        if user["balance"] < points:
+        user = row_to_dict(user_row)
+        if int(user["balance"]) < points:
             return (
                 False,
                 f"Недостаточно кармы: на балансе {user['balance']}, "
@@ -700,7 +834,7 @@ async def deduct_karma(
         if updated_row is None:
             return False, "Не удалось прочитать баланс после списания.", None
 
-        updated = dict(updated_row)
+        updated = row_to_dict(updated_row)
         return (
             True,
             "Списано.",
@@ -969,26 +1103,29 @@ async def spend_karma(message: Message) -> None:
 
 
 async def main() -> None:
-    await init_db()
-    # Если у бота ранее был настроен webhook, polling не будет получать апдейты.
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 6):
-        try:
-            await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
-            me = await bot.get_me(request_timeout=30)
-            print(f"Bot started: @{me.username} (id={me.id})", flush=True)
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            print(
-                f"Failed to reach Telegram API (attempt {attempt}/5): {e!r}",
-                flush=True,
-            )
-            await asyncio.sleep(min(2**attempt, 20))
-    if last_err is not None:
-        raise last_err
-    await dp.start_polling(bot)
+    try:
+        await init_db()
+        # Если у бота ранее был настроен webhook, polling не будет получать апдейты.
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 6):
+            try:
+                await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
+                me = await bot.get_me(request_timeout=30)
+                print(f"Bot started: @{me.username} (id={me.id})", flush=True)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                print(
+                    f"Failed to reach Telegram API (attempt {attempt}/5): {e!r}",
+                    flush=True,
+                )
+                await asyncio.sleep(min(2**attempt, 20))
+        if last_err is not None:
+            raise last_err
+        await dp.start_polling(bot)
+    finally:
+        await close_db_backend()
 
 
 if __name__ == "__main__":
