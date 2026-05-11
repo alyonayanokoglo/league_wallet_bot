@@ -27,12 +27,12 @@ from questions_handlers import register_questions_handlers
 from quiz_handlers import register_quiz_handlers
 
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+# Явный путь: при запуске из другой cwd (например Railway) корневой .env не подхватится.
+load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-
-BASE_DIR = Path(__file__).resolve().parent
 CAREER_DEMO_PHOTO_PATH = BASE_DIR / "img" / "1920х1080 (1) (1).png"
 BALANCE_PHOTO_PATH = BASE_DIR / "img" / "1200Х600 (1) (1).png"
 
@@ -51,7 +51,10 @@ ACTIVITY_ADMIN_LECTURE_FALLBACK = "Лекция (админ)"
 ACTIVITY_ADMIN_MANUAL = "Ручное начисление (админ)"
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN. Проверь файл .env")
+    raise RuntimeError(
+        "Не задан BOT_TOKEN. Локально — в tg_coin_bot/.env; на Railway — "
+        "Variables → добавь BOT_TOKEN (и при необходимости ADMIN_IDS, DB_PATH)."
+    )
 
 
 class Registration(StatesGroup):
@@ -772,7 +775,7 @@ async def start(message: Message, state: FSMContext) -> None:
     await state.set_state(Registration.waiting_for_badge_id)
     await message.answer(
         "Привет! Я Кошелёк кармы.\n\n"
-        "Карма — внутренняя валюта Совкомбанка и Лиги приключений. "
+        "Карма — внутренняя валюта Совкомбанка и Лиги Приключений. "
         "На неё ты сможешь купить классный мерч в магазине товаров.\n\n"
         "Введи номер со своего браслета (4 цифры), чтобы продолжить."
     )
